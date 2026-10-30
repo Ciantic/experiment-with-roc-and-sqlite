@@ -1,0 +1,23 @@
+# Roc build output (`roc build main.roc` writes the executable next to the source)
+/main
+/main.exe
+/main.pdb
+*.dSYM/
+
+# Downloaded platform archives (`cli: platform "https://…/Gddg….tar.zst"`)
+*.tar.zst
+
+# Platform sources extracted while building, and other temporary build dirs
+.roc-tmp/
+roc-tmp/
+
+# Zig caches, used when a platform is built from source
+.zig-cache/
+zig-cache/
+zig-out/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
