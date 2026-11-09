@@ -192,18 +192,18 @@ unit_cents = Projection.i64("unit_cents")
 # the language turns `Invoice` into `["id", "number", …]`. Each column constant
 # above exists because a field's type has to be stated once (`str` vs `i64`), and
 # that cannot be read back off the record type.
-# The SQL table name lives here, once per tag.
-invoice_table : Projection(Invoices, a, err) -> Table(Invoices, a, err)
-invoice_table = |projection| Table.from_projection("invoices", projection)
 
-invoice_row_table : Projection(InvoiceRows, a, err) -> Table(InvoiceRows, a, err)
-invoice_row_table = |projection| Table.from_projection("invoice_rows", projection)
+# The SQL table name lives here, once per tag, next to the projection it names.
+invoice_table : Table(Invoices, Invoice, _)
+invoice_table =
+	Table.from_projection("invoices", { id, number, customer, status, paid_on }.Projection)
 
-invoice_projection : Table(Invoices, Invoice, _)
-invoice_projection = invoice_table({ id, number, customer, status, paid_on }.Projection)
-
-invoice_row_projection : Table(InvoiceRows, InvoiceRow, _)
-invoice_row_projection = invoice_row_table({ row_id, invoice_id, description, quantity, unit_cents }.Projection)
+invoice_row_table : Table(InvoiceRows, InvoiceRow, _)
+invoice_row_table =
+	Table.from_projection(
+		"invoice_rows",
+		{ row_id, invoice_id, description, quantity, unit_cents }.Projection,
+	)
 
 # The SQL names exactly the columns the projection carries.
 quote_column : Str -> Str
@@ -214,19 +214,19 @@ main! = |_| {
 	setup!(db)?
 
 	Stdout.line!("Invoices, id and number (subset of the table projection):")?
-	for invoice in invoice_projection.subset({ id, number }.Projection).query!(db)? {
+	for invoice in invoice_table.subset({ id, number }.Projection).query!(db)? {
 		Stdout.line!("  #${invoice.id.to_str()}  ${invoice.number}")?
 	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, number and status:")?
-	for invoice in invoice_projection.subset({ number, status }.Projection).query!(db)? {
+	for invoice in invoice_table.subset({ number, status }.Projection).query!(db)? {
 		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
 	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, every column:")?
-	for invoice in invoice_projection.query!(db)? {
+	for invoice in invoice_table.query!(db)? {
 		paid = match invoice.paid_on {
 			Ok(date) => "paid ${date}"
 			Err(Null) => "open"
@@ -236,13 +236,13 @@ main! = |_| {
 
 	Stdout.line!("")?
 	Stdout.line!("Invoice rows, description and quantity (subset of the row table):")?
-	for row in invoice_row_projection.subset({ description, quantity }.Projection).query!(db)? {
+	for row in invoice_row_table.subset({ description, quantity }.Projection).query!(db)? {
 		Stdout.line!("  ${row.description}  ${row.quantity.to_str()}")?
 	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoice rows, every column:")?
-	for row in invoice_row_projection.query!(db)? {
+	for row in invoice_row_table.query!(db)? {
 		Stdout.line!(
 			"  row #${row.row_id.to_str()}  invoice ${row.invoice_id.to_str()}  ${row.description}  ${row.quantity.to_str()} x ${format_cents(row.unit_cents)}",
 		)?
