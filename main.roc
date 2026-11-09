@@ -1,6 +1,8 @@
 ## An in-memory SQLite database with two related tables, `invoices` and
 ## `invoice_rows`. A `Table` is a record of typed columns bound to a table, so
-## `query!` selects exactly those columns and each query is a record shape.
+## `query!` selects exactly those columns and each query is a record shape;
+## `filter_in` adds bound `WHERE ... IN (...)` terms, in any order relative to
+## `select`.
 ## Each column constant carries its table as a phantom type tag, so mixing
 ## columns from two tables — `{ id, unit_cents }.Projection` — is a type error
 ## rather than a runtime surprise.
@@ -106,13 +108,27 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 	to_columns = |projection| projection.columns
 }
 
-# A projection bound to a table: the columns, their decoder, and where they
-# live. Binding the name here is what lets the same projection be queried, and
-# lets `select` name the table it checked against.
-Table(table, a, err) := { name : Str, columns : List(Str), decoder : Decoder(a, err) }.{
+# One `WHERE` term: SQL with `?` markers, and the values for them.
+no_filters : List(Filter)
+no_filters = []
+
+# A projection bound to a table: the columns, their decoder, where they live,
+# and any filters to apply. Binding the name here is what lets the same
+# projection be queried, and lets `select` name the table it checked against.
+Table(table, a, err) := {
+	name : Str,
+	columns : List(Str),
+	decoder : Decoder(a, err),
+	filters : List(Filter),
+}.{
 	from_projection : Str, Projection(table, a, err) -> Table(table, a, err)
 	from_projection = |name, projection|
-		Table.{ name, columns: projection.columns, decoder: projection.decoder }
+		Table.{
+			name,
+			columns: projection.columns,
+			decoder: projection.decoder,
+			filters: no_filters,
+		}
 
 	# Narrow a table projection to the columns picked from it.
 	#
@@ -129,18 +145,90 @@ Table(table, a, err) := { name : Str, columns : List(Str), decoder : Decoder(a, 
 				crash "not a column of ${table.name}: ${Str.inspect(name)}"
 			}
 		}
-		Table.{ name: table.name, columns: picked.columns, decoder: picked.decoder }
+		Table.{
+			name: table.name,
+			columns: picked.columns,
+			decoder: picked.decoder,
+			filters: table.filters,
+		}
 	}
+
+	# Keep the rows whose column is one of `values`, as SQL `IN`.
+	#
+	# The tag on `column` makes a foreign column a type error even here, after
+	# `select` has narrowed the output columns: the filter is part of the
+	# `WHERE` clause, not of the `SELECT` list, so it may name any column of
+	# the table. An empty list matches nothing, which is what `IN ()` would
+	# mean if SQLite accepted it.
+	filter_in : Table(t, a, err), Projection(t, I64, err), List(I64) -> Table(t, a, err)
+	filter_in = |table, column, values|
+		table.add_filter(Filter.in_i64(column, values))
+
+	filter_in_str : Table(t, a, err), Projection(t, Str, err), List(Str) -> Table(t, a, err)
+	filter_in_str = |table, column, values|
+		table.add_filter(Filter.in_str(column, values))
+
+	add_filter : Table(t, a, err), Filter -> Table(t, a, err)
+	add_filter = |table, filter|
+		Table.{
+			name: table.name,
+			columns: table.columns,
+			decoder: table.decoder,
+			filters: table.filters.append(filter),
+		}
+
+	# The `WHERE` clause, filters joined with `AND`; empty when unfiltered.
+	where_clause : Table(t, a, err) -> Str
+	where_clause = |table|
+		if List.is_empty(table.filters) {
+			""
+		} else {
+			" WHERE ${Str.join_with(table.filters.map(|filter| filter.sql), " AND ")}"
+		}
 
 	# The statement this table projection runs.
 	to_sql : Table(t, a, err) -> Str
 	to_sql = |table|
-		"SELECT ${Str.join_with(table.columns.map(quote_column), ", ")} FROM ${table.name} ORDER BY id"
+		"SELECT ${Str.join_with(table.columns.map(quote_column), ", ")} FROM ${table.name}${table.where_clause()} ORDER BY id"
 
-	# Run it: the columns become the SELECT list, the decoders read the rows.
+	# The values for its `?` markers, in order.
+	to_params : Table(t, a, err) -> List(Sqlite.Value)
+	to_params = |table| {
+		var $params = []
+		for filter in table.filters {
+			$params = $params.concat(filter.params)
+		}
+		$params
+	}
+
+	# Run it: the columns become the SELECT list, the decoders read the rows,
+	# and the filters are bound as parameters.
 	query! : Table(t, a, err), Sqlite.Db => Try(List(a), _)
 	query! = |table, db| {
-		db.query_all!(Sqlite.Query.new(table.to_sql(), []), table.decoder)
+		db.query_all!(Sqlite.Query.new(table.to_sql(), table.to_params()), table.decoder)
+	}
+}
+
+# The filters themselves, next to the `filter_in` shorthands that use them.
+Filter := { sql : Str, params : List(Sqlite.Value) }.{
+	in_i64 : Projection(t, I64, err), List(I64) -> Filter
+	in_i64 = |column, values| Filter.in_sql(column, values.map(|value| Integer(value)))
+
+	in_str : Projection(t, Str, err), List(Str) -> Filter
+	in_str = |column, values| Filter.in_sql(column, values.map(|value| String(value)))
+
+	in_sql : Projection(t, e, err), List(Sqlite.Value) -> Filter
+	in_sql = |column, values| {
+		# `IN ()` is a syntax error, so an empty list becomes `0`: match
+		# nothing, the same meaning `IN` over no values would have.
+		name = column.to_columns().get(0) ?? crash "a filter needs one column"
+		sql = if List.is_empty(values) {
+			"0"
+		} else {
+			marks = Str.join_with(values.map(|_| "?"), ", ")
+			"${quote_column(name)} IN (${marks})"
+		}
+		Filter.{ sql, params: values }
 	}
 }
 
@@ -223,6 +311,39 @@ main! = |_| {
 	for invoice in invoice_table.select({ number, status }.Projection).query!(db)? {
 		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
 	}
+
+	# Filters are `WHERE` terms, so they may name a column the `select`
+	# dropped: `id` is not among the output columns below, but it is still a
+	# column of `invoices`. Chain them in either order.
+	Stdout.line!("")?
+	Stdout.line!("Invoices 1 and 3, filtered then selected:")?
+	for invoice in invoice_table.filter_in(id, [1, 3]).select({ number, status }.Projection).query!(db)? {
+		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
+	}
+
+	Stdout.line!("")?
+	Stdout.line!("Same, selected then filtered:")?
+	for invoice in invoice_table.select({ number, status }.Projection).filter_in(id, [1, 3]).query!(db)? {
+		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
+	}
+
+	Stdout.line!("")?
+	Stdout.line!("Two filters are ANDed, with parameters bound in order:")?
+	filtered = invoice_table
+		.filter_in(id, [1, 2, 3])
+		.filter_in_str(customer, ["Acme Ltd", "Initech"])
+		.select({ customer, status }.Projection)
+	Stdout.line!("  ${Table.to_sql(filtered)}")?
+	for invoice in filtered.query!(db)? {
+		Stdout.line!("  ${invoice.customer}  ${status_to_str(invoice.status)}")?
+	}
+
+	Stdout.line!("")?
+	Stdout.line!("An empty id list matches nothing:")?
+	for invoice in invoice_table.filter_in(id, []).select({ number, status }.Projection).query!(db)? {
+		Stdout.line!("  ${invoice.number}")?
+	}
+	Stdout.line!("  (no rows)")?
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, every column:")?
