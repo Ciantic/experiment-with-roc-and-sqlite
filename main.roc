@@ -108,7 +108,7 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 
 # A projection bound to a table: the columns, their decoder, and where they
 # live. Binding the name here is what lets the same projection be queried, and
-# lets `subset` name the table it checked against.
+# lets `select` name the table it checked against.
 Table(table, a, err) := { name : Str, columns : List(Str), decoder : Decoder(a, err) }.{
 	from_projection : Str, Projection(table, a, err) -> Table(table, a, err)
 	from_projection = |name, projection|
@@ -118,12 +118,12 @@ Table(table, a, err) := { name : Str, columns : List(Str), decoder : Decoder(a, 
 	#
 	# The type parameter already guarantees the picked columns come from this
 	# table: `Projection(t, …)` unifies only with columns built for the same
-	# tag, so a cross-table pick is a compile error before `subset` is reached.
+	# tag, so a cross-table pick is a compile error before `select` is reached.
 	# The loop below is the remaining runtime guard: a column constant whose
 	# name is not in this table's projection (a typo in `Projection.str`) would
 	# otherwise produce SQL selecting a name the table may not have.
-	subset : Table(t, a, err), Projection(t, b, err) -> Table(t, b, err)
-	subset = |table, picked| {
+	select : Table(t, a, err), Projection(t, b, err) -> Table(t, b, err)
+	select = |table, picked| {
 		for name in picked.columns {
 			if !List.contains(table.columns, name) {
 				crash "not a column of ${table.name}: ${Str.inspect(name)}"
@@ -213,14 +213,14 @@ main! = |_| {
 	db = Sqlite.open_in_memory!()?
 	setup!(db)?
 
-	Stdout.line!("Invoices, id and number (subset of the table projection):")?
-	for invoice in invoice_table.subset({ id, number }.Projection).query!(db)? {
+	Stdout.line!("Invoices, id and number, selected from the table projection:")?
+	for invoice in invoice_table.select({ id, number }.Projection).query!(db)? {
 		Stdout.line!("  #${invoice.id.to_str()}  ${invoice.number}")?
 	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, number and status:")?
-	for invoice in invoice_table.subset({ number, status }.Projection).query!(db)? {
+	for invoice in invoice_table.select({ number, status }.Projection).query!(db)? {
 		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
 	}
 
@@ -235,8 +235,8 @@ main! = |_| {
 	}
 
 	Stdout.line!("")?
-	Stdout.line!("Invoice rows, description and quantity (subset of the row table):")?
-	for row in invoice_row_table.subset({ description, quantity }.Projection).query!(db)? {
+	Stdout.line!("Invoice rows, description and quantity, selected from the row projection:")?
+	for row in invoice_row_table.select({ description, quantity }.Projection).query!(db)? {
 		Stdout.line!("  ${row.description}  ${row.quantity.to_str()}")?
 	}
 
