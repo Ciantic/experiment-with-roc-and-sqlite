@@ -1,8 +1,10 @@
 ## An in-memory SQLite database with two related tables, `invoices` and
 ## `invoice_rows`. A `Table` is a record of typed columns bound to a table, so
-## `query!` selects exactly those columns and each query is a record shape;
-## `filter_in` adds bound `WHERE ... IN (...)` terms, in any order relative to
-## `select`.
+## `query!` selects exactly those columns and each query is a record shape.
+## `Table` is a projection bound to its table and cannot change; `select` and
+## `filter_in` return a `Queryable` that holds the table's metadata plus the
+## selected projection, so a query accumulates bound `WHERE ... IN (...)` terms
+## without the table's definition changing.
 ## Each column constant carries its table as a phantom type tag, so mixing
 ## columns from two tables — `{ id, unit_cents }.Projection` — is a type error
 ## rather than a runtime surprise.
@@ -112,100 +114,125 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 no_filters : List(Filter)
 no_filters = []
 
-# A projection bound to a table: the columns, their decoder, where they live,
-# and any filters to apply. Binding the name here is what lets the same
-# projection be queried, and lets `select` name the table it checked against.
-Table(table, a, err) := {
-	name : Str,
-	columns : List(Str),
-	decoder : Decoder(a, err),
-	filters : List(Filter),
-}.{
+# A table's identity: its name and its full column list, with no decoder and
+# so no row type. This is the part a query keeps as it narrows — the decoder
+# travels in the projection instead, because it changes with `select`.
+TableMeta(table) := { name : Str, columns : List(Str) }.{
+	from_projection : Str, Projection(table, a, err) -> TableMeta(table)
+	from_projection = |name, projection| TableMeta.{ name, columns: projection.columns }
+
+	to_columns : TableMeta(table) -> List(Str)
+	to_columns = |meta| meta.columns
+}
+
+# A projection bound to its table: the metadata plus the decoder for the full
+# row. It cannot change; `select` and `filter_in` return a `Queryable`.
+Table(table, a, err) := { meta : TableMeta(table), projection : Projection(table, a, err) }.{
 	from_projection : Str, Projection(table, a, err) -> Table(table, a, err)
 	from_projection = |name, projection|
-		Table.{
-			name,
-			columns: projection.columns,
-			decoder: projection.decoder,
+		Table.{ meta: TableMeta.from_projection(name, projection), projection }
+
+	to_columns : Table(table, a, err) -> List(Str)
+	to_columns = |table| table.meta.to_columns()
+
+	to_decoder : Table(table, a, err) -> Decoder(a, err)
+	to_decoder = |table| table.projection.decoder
+
+	# Start a queryable: the whole row, no filters.
+	to_query : Table(table, a, err) -> Queryable(table, a, err)
+	to_query = |table|
+		Queryable.{
+			table: table.meta,
+			projection: table.projection,
 			filters: no_filters,
 		}
 
-	# Narrow a table projection to the columns picked from it.
+	select : Table(table, a, err), Projection(table, b, err) -> Queryable(table, b, err)
+	select = |table, picked| table.to_query().select(picked)
+
+	filter_in : Table(table, a, err), Projection(table, I64, err), List(I64) -> Queryable(table, a, err)
+	filter_in = |table, column, values| table.to_query().filter_in(column, values)
+
+	filter_in_str : Table(table, a, err), Projection(table, Str, err), List(Str) -> Queryable(table, a, err)
+	filter_in_str = |table, column, values| table.to_query().filter_in_str(column, values)
+
+	query! : Table(table, a, err), Sqlite.Db => Try(List(a), _)
+	query! = |table, db| table.to_query().query!(db)
+}
+
+# A table projection that can be queried: the table's identity, the columns
+# selected so far, and the filters to apply.
+#
+# `table` keeps the full column list, so a filter or a later `select` may still
+# name a column an earlier `select` dropped; `projection` carries both the
+# selected column names and their decoders, so the two cannot drift.
+Queryable(table, a, err) := {
+	table : TableMeta(table),
+	projection : Projection(table, a, err),
+	filters : List(Filter),
+}.{
+	# Narrow the output to the columns picked.
 	#
 	# The type parameter already guarantees the picked columns come from this
 	# table: `Projection(t, …)` unifies only with columns built for the same
-	# tag, so a cross-table pick is a compile error before `select` is reached.
-	# The loop below is the remaining runtime guard: a column constant whose
-	# name is not in this table's projection (a typo in `Projection.str`) would
-	# otherwise produce SQL selecting a name the table may not have.
-	select : Table(t, a, err), Projection(t, b, err) -> Table(t, b, err)
-	select = |table, picked| {
+	# tag, so a cross-table pick is a compile error before this is reached.
+	# The loop is the remaining runtime guard: a column constant whose name is
+	# not in the table (a typo in `Projection.str`) would otherwise produce SQL
+	# selecting a name the table may not have.
+	select : Queryable(table, a, err), Projection(table, b, err) -> Queryable(table, b, err)
+	select = |query, picked| {
 		for name in picked.columns {
-			if !List.contains(table.columns, name) {
-				crash "not a column of ${table.name}: ${Str.inspect(name)}"
+			if !List.contains(query.table.columns, name) {
+				crash "not a column of ${query.table.name}: ${Str.inspect(name)}"
 			}
 		}
-		Table.{
-			name: table.name,
-			columns: picked.columns,
-			decoder: picked.decoder,
-			filters: table.filters,
-		}
+		Queryable.{ table: query.table, projection: picked, filters: query.filters }
 	}
 
 	# Keep the rows whose column is one of `values`, as SQL `IN`.
-	#
-	# The tag on `column` makes a foreign column a type error even here, after
-	# `select` has narrowed the output columns: the filter is part of the
-	# `WHERE` clause, not of the `SELECT` list, so it may name any column of
-	# the table. An empty list matches nothing, which is what `IN ()` would
-	# mean if SQLite accepted it.
-	filter_in : Table(t, a, err), Projection(t, I64, err), List(I64) -> Table(t, a, err)
-	filter_in = |table, column, values|
-		table.add_filter(Filter.in_i64(column, values))
+	filter_in : Queryable(table, a, err), Projection(table, I64, err), List(I64) -> Queryable(table, a, err)
+	filter_in = |query, column, values| query.add_filter(Filter.in_i64(column, values))
 
-	filter_in_str : Table(t, a, err), Projection(t, Str, err), List(Str) -> Table(t, a, err)
-	filter_in_str = |table, column, values|
-		table.add_filter(Filter.in_str(column, values))
+	filter_in_str : Queryable(table, a, err), Projection(table, Str, err), List(Str) -> Queryable(table, a, err)
+	filter_in_str = |query, column, values| query.add_filter(Filter.in_str(column, values))
 
-	add_filter : Table(t, a, err), Filter -> Table(t, a, err)
-	add_filter = |table, filter|
-		Table.{
-			name: table.name,
-			columns: table.columns,
-			decoder: table.decoder,
-			filters: table.filters.append(filter),
+	add_filter : Queryable(table, a, err), Filter -> Queryable(table, a, err)
+	add_filter = |query, filter|
+		Queryable.{
+			table: query.table,
+			projection: query.projection,
+			filters: query.filters.append(filter),
 		}
 
 	# The `WHERE` clause, filters joined with `AND`; empty when unfiltered.
-	where_clause : Table(t, a, err) -> Str
-	where_clause = |table|
-		if List.is_empty(table.filters) {
+	where_clause : Queryable(table, a, err) -> Str
+	where_clause = |query|
+		if List.is_empty(query.filters) {
 			""
 		} else {
-			" WHERE ${Str.join_with(table.filters.map(|filter| filter.sql), " AND ")}"
+			" WHERE ${Str.join_with(query.filters.map(|filter| filter.sql), " AND ")}"
 		}
 
-	# The statement this table projection runs.
-	to_sql : Table(t, a, err) -> Str
-	to_sql = |table|
-		"SELECT ${Str.join_with(table.columns.map(quote_column), ", ")} FROM ${table.name}${table.where_clause()} ORDER BY id"
+	# The statement this query runs.
+	to_sql : Queryable(table, a, err) -> Str
+	to_sql = |query|
+		"SELECT ${Str.join_with(query.projection.columns.map(quote_column), ", ")} FROM ${query.table.name}${query.where_clause()} ORDER BY id"
 
 	# The values for its `?` markers, in order.
-	to_params : Table(t, a, err) -> List(Sqlite.Value)
-	to_params = |table| {
+	to_params : Queryable(table, a, err) -> List(Sqlite.Value)
+	to_params = |query| {
 		var $params = []
-		for filter in table.filters {
+		for filter in query.filters {
 			$params = $params.concat(filter.params)
 		}
 		$params
 	}
 
-	# Run it: the columns become the SELECT list, the decoders read the rows,
-	# and the filters are bound as parameters.
-	query! : Table(t, a, err), Sqlite.Db => Try(List(a), _)
-	query! = |table, db| {
-		db.query_all!(Sqlite.Query.new(table.to_sql(), table.to_params()), table.decoder)
+	# Run it: the selected columns become the SELECT list, the decoders read
+	# the rows, and the filters are bound as parameters.
+	query! : Queryable(table, a, err), Sqlite.Db => Try(List(a), _)
+	query! = |query, db| {
+		db.query_all!(Sqlite.Query.new(query.to_sql(), query.to_params()), query.projection.decoder)
 	}
 }
 
@@ -333,7 +360,7 @@ main! = |_| {
 		.filter_in(id, [1, 2, 3])
 		.filter_in_str(customer, ["Acme Ltd", "Initech"])
 		.select({ customer, status }.Projection)
-	Stdout.line!("  ${Table.to_sql(filtered)}")?
+	Stdout.line!("  ${Queryable.to_sql(filtered)}")?
 	for invoice in filtered.query!(db)? {
 		Stdout.line!("  ${invoice.customer}  ${status_to_str(invoice.status)}")?
 	}
