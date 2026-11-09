@@ -4,7 +4,9 @@
 ## `Table` is a projection bound to its table and cannot change; `select` and
 ## `filter_in` return a `Queryable` that holds the table's metadata plus the
 ## selected projection, so a query accumulates bound `WHERE ... IN (...)` terms
-## without the table's definition changing.
+## without the table's definition changing. Filterability is a phantom type
+## parameter on the column's own type, so only a column annotated
+## `IsFilterable` may appear in a `WHERE`.
 ## Each column constant carries its table as a phantom type tag, so mixing
 ## columns from two tables — `{ id, unit_cents }.Projection` — is a type error
 ## rather than a runtime surprise.
@@ -53,10 +55,23 @@ Invoices := {}
 
 InvoiceRows := {}
 
+# Filter flags: phantom types marking whether a column may appear in a `WHERE`.
+#
+# Columns are built `NotFilterable`, and only `Projection.filterable` re-tags
+# one. `filter_in` demands `IsFilterable`, so filtering a column is an explicit,
+# reviewable opt-in written into that column's annotation — `unit_cents` has
+# none, so it cannot be filtered on. Roc has no module privacy, so an
+# `IsFilterable` can still be minted anywhere in the file; the flag makes the
+# opt-in visible, not impossible.
+IsFilterable := {}
+
+NotFilterable := {}
+
 # A decoder paired with the columns it reads. `Sqlite.Decoder` is opaque, so
 # its own column list cannot drive the SQL; this keeps a visible copy alongside
-# it, built by the same call.
-Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.{
+# it, built by the same call. The `flag` parameter is phantom: it never reaches
+# a value, and exists only to carry filterability in the type.
+Projection(table, flag, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.{
 	# What the record-builder suffix calls: `{ number, status }.Projection`
 	# folds a record of projections into one projection of a record, combining
 	# each pair with this function.
@@ -69,7 +84,15 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 	# single-column record cannot be folded at all.
 	# Both sides must name the same table, and so must their error rows: mixing
 	# an `invoices` column with an `invoice_rows` one fails to typecheck here.
-	map2 : Projection(t, a, err), Projection(t, b, err), (a, b -> c) -> Projection(t, c, err)
+	map2 :
+		Projection(t, f1, a, err),
+		Projection(t, f2, b, err),
+		(a, b -> c) -> Projection(
+			t,
+			NotFilterable,
+			c,
+			err,
+		)
 	map2 = |first, second, combine|
 		Projection.{
 			columns: first.columns.concat(second.columns),
@@ -77,20 +100,20 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 		}
 
 	# One column, from any leaf decoder.
-	field : Str, (Sqlite.Column -> Decoder(a, err)) -> Projection(t, a, err)
+	field : Str, (Sqlite.Column -> Decoder(a, err)) -> Projection(t, NotFilterable, a, err)
 	field = |name, make| {
 		column = Sqlite.Column.from_quote(name) ?? crash "a column name is a plain Str"
 		Projection.{ columns: [name], decoder: make(column) }
 	}
 
-	str : Str -> Projection(t, Str, _)
+	str : Str -> Projection(t, NotFilterable, Str, _)
 	str = |name| field(name, Decoder.str)
 
-	i64 : Str -> Projection(t, I64, _)
+	i64 : Str -> Projection(t, NotFilterable, I64, _)
 	i64 = |name| field(name, Decoder.i64)
 
 	# Accept SQL `NULL`, decoding to `Err(Null)` when the column is NULL.
-	nullable : Projection(t, a, err) -> Projection(t, Try(a, [Null]), err)
+	nullable : Projection(t, flag, a, err) -> Projection(t, flag, Try(a, [Null]), err)
 	nullable = |projection|
 		Projection.{
 			columns: projection.columns,
@@ -98,7 +121,7 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 		}
 
 	# Transform the decoded value with a function that can fail.
-	map_try : Projection(t, a, err), (a -> Try(b, err)) -> Projection(t, b, err)
+	map_try : Projection(t, flag, a, err), (a -> Try(b, err)) -> Projection(t, flag, b, err)
 	map_try = |projection, transform|
 		Projection.{
 			columns: projection.columns,
@@ -106,8 +129,28 @@ Projection(table, a, err) := { columns : List(Str), decoder : Decoder(a, err) }.
 		}
 
 	# The columns this projection reads, for building SQL or for tests.
-	to_columns : Projection(t, a, err) -> List(Str)
+	to_columns : Projection(t, flag, a, err) -> List(Str)
 	to_columns = |projection| projection.columns
+
+	# Opt a column into `WHERE`: the only way to obtain an `IsFilterable`.
+	filterable : Projection(t, flag, a, err) -> Projection(t, IsFilterable, a, err)
+	filterable = |projection|
+		Projection.{ columns: projection.columns, decoder: projection.decoder }
+
+	# Drop the flag, for storing a projection where filterability is irrelevant.
+	as_plain : Projection(t, flag, a, err) -> Projection(t, NotFilterable, a, err)
+	as_plain = |projection|
+		Projection.{ columns: projection.columns, decoder: projection.decoder }
+
+	# Re-tag as `IsFilterable` only if the column can be one: a value-level
+	# check for the case where the name came from data rather than a constant.
+	try_filterable : Projection(t, flag, a, err) -> Try(Projection(t, IsFilterable, a, err), [ManyColumns])
+	try_filterable = |projection|
+		if projection.columns.len() == 1 {
+			Ok(Projection.filterable(projection))
+		} else {
+			Err(ManyColumns)
+		}
 }
 
 # One `WHERE` term: SQL with `?` markers, and the values for them.
@@ -118,7 +161,7 @@ no_filters = []
 # so no row type. This is the part a query keeps as it narrows — the decoder
 # travels in the projection instead, because it changes with `select`.
 TableMeta(table) := { name : Str, columns : List(Str) }.{
-	from_projection : Str, Projection(table, a, err) -> TableMeta(table)
+	from_projection : Str, Projection(table, flag, a, err) -> TableMeta(table)
 	from_projection = |name, projection| TableMeta.{ name, columns: projection.columns }
 
 	to_columns : TableMeta(table) -> List(Str)
@@ -127,10 +170,16 @@ TableMeta(table) := { name : Str, columns : List(Str) }.{
 
 # A projection bound to its table: the metadata plus the decoder for the full
 # row. It cannot change; `select` and `filter_in` return a `Queryable`.
-Table(table, a, err) := { meta : TableMeta(table), projection : Projection(table, a, err) }.{
-	from_projection : Str, Projection(table, a, err) -> Table(table, a, err)
+Table(table, a, err) := {
+	meta : TableMeta(table),
+	projection : Projection(table, NotFilterable, a, err),
+}.{
+	from_projection : Str, Projection(table, flag, a, err) -> Table(table, a, err)
 	from_projection = |name, projection|
-		Table.{ meta: TableMeta.from_projection(name, projection), projection }
+		Table.{
+			meta: TableMeta.from_projection(name, projection),
+			projection: Projection.as_plain(projection),
+		}
 
 	to_columns : Table(table, a, err) -> List(Str)
 	to_columns = |table| table.meta.to_columns()
@@ -147,14 +196,14 @@ Table(table, a, err) := { meta : TableMeta(table), projection : Projection(table
 			filters: no_filters,
 		}
 
-	select : Table(table, a, err), Projection(table, b, err) -> Queryable(table, b, err)
+	select : Table(table, a, err), Projection(table, flag, b, err) -> Queryable(table, b, err)
 	select = |table, picked| table.to_query().select(picked)
 
-	filter_in : Table(table, a, err), Projection(table, I64, err), List(I64) -> Queryable(table, a, err)
-	filter_in = |table, column, values| table.to_query().filter_in(column, values)
+	filter_in : Table(table, a, err), Projection(table, IsFilterable, I64, err), List(I64) -> Queryable(table, a, err)
+	filter_in = |table, key, values| table.to_query().filter_in(key, values)
 
-	filter_in_str : Table(table, a, err), Projection(table, Str, err), List(Str) -> Queryable(table, a, err)
-	filter_in_str = |table, column, values| table.to_query().filter_in_str(column, values)
+	filter_in_str : Table(table, a, err), Projection(table, IsFilterable, Str, err), List(Str) -> Queryable(table, a, err)
+	filter_in_str = |table, key, values| table.to_query().filter_in_str(key, values)
 
 	query! : Table(table, a, err), Sqlite.Db => Try(List(a), _)
 	query! = |table, db| table.to_query().query!(db)
@@ -168,7 +217,7 @@ Table(table, a, err) := { meta : TableMeta(table), projection : Projection(table
 # selected column names and their decoders, so the two cannot drift.
 Queryable(table, a, err) := {
 	table : TableMeta(table),
-	projection : Projection(table, a, err),
+	projection : Projection(table, NotFilterable, a, err),
 	filters : List(Filter),
 }.{
 	# Narrow the output to the columns picked.
@@ -179,22 +228,26 @@ Queryable(table, a, err) := {
 	# The loop is the remaining runtime guard: a column constant whose name is
 	# not in the table (a typo in `Projection.str`) would otherwise produce SQL
 	# selecting a name the table may not have.
-	select : Queryable(table, a, err), Projection(table, b, err) -> Queryable(table, b, err)
+	select : Queryable(table, a, err), Projection(table, flag, b, err) -> Queryable(table, b, err)
 	select = |query, picked| {
 		for name in picked.columns {
 			if !List.contains(query.table.columns, name) {
 				crash "not a column of ${query.table.name}: ${Str.inspect(name)}"
 			}
 		}
-		Queryable.{ table: query.table, projection: picked, filters: query.filters }
+		Queryable.{
+			table: query.table,
+			projection: Projection.as_plain(picked),
+			filters: query.filters,
+		}
 	}
 
 	# Keep the rows whose column is one of `values`, as SQL `IN`.
-	filter_in : Queryable(table, a, err), Projection(table, I64, err), List(I64) -> Queryable(table, a, err)
-	filter_in = |query, column, values| query.add_filter(Filter.in_i64(column, values))
+	filter_in : Queryable(table, a, err), Projection(table, IsFilterable, I64, err), List(I64) -> Queryable(table, a, err)
+	filter_in = |query, key, values| query.add_filter(Filter.in_i64(key, values))
 
-	filter_in_str : Queryable(table, a, err), Projection(table, Str, err), List(Str) -> Queryable(table, a, err)
-	filter_in_str = |query, column, values| query.add_filter(Filter.in_str(column, values))
+	filter_in_str : Queryable(table, a, err), Projection(table, IsFilterable, Str, err), List(Str) -> Queryable(table, a, err)
+	filter_in_str = |query, key, values| query.add_filter(Filter.in_str(key, values))
 
 	add_filter : Queryable(table, a, err), Filter -> Queryable(table, a, err)
 	add_filter = |query, filter|
@@ -238,17 +291,17 @@ Queryable(table, a, err) := {
 
 # The filters themselves, next to the `filter_in` shorthands that use them.
 Filter := { sql : Str, params : List(Sqlite.Value) }.{
-	in_i64 : Projection(t, I64, err), List(I64) -> Filter
-	in_i64 = |column, values| Filter.in_sql(column, values.map(|value| Integer(value)))
+	in_i64 : Projection(t, IsFilterable, I64, err), List(I64) -> Filter
+	in_i64 = |key, values| Filter.in_sql(key, values.map(|value| Integer(value)))
 
-	in_str : Projection(t, Str, err), List(Str) -> Filter
-	in_str = |column, values| Filter.in_sql(column, values.map(|value| String(value)))
+	in_str : Projection(t, IsFilterable, Str, err), List(Str) -> Filter
+	in_str = |key, values| Filter.in_sql(key, values.map(|value| String(value)))
 
-	in_sql : Projection(t, e, err), List(Sqlite.Value) -> Filter
-	in_sql = |column, values| {
+	in_sql : Projection(t, IsFilterable, e, err), List(Sqlite.Value) -> Filter
+	in_sql = |key, values| {
 		# `IN ()` is a syntax error, so an empty list becomes `0`: match
 		# nothing, the same meaning `IN` over no values would have.
-		name = column.to_columns().get(0) ?? crash "a filter needs one column"
+		name = key.to_columns().get(0) ?? crash "a filter needs one column"
 		sql = if List.is_empty(values) {
 			"0"
 		} else {
@@ -262,37 +315,42 @@ Filter := { sql : Str, params : List(Sqlite.Value) }.{
 # Each column is typed once, here, and named after its field, so a projection
 # is a record of puns: `{ number, status }.Projection`.
 #
+# The second type argument is the filter flag. A column annotated
+# `IsFilterable` can appear in a `WHERE`; one annotated `NotFilterable` cannot.
+# That annotation, plus the `Projection.filterable` call beside it, is the whole
+# opt-in — there is no separate list to keep in step.
+#
 # They sit above `main!` because a punned record literal inside a function body
 # does not see top-level definitions declared later in the file (a limitation of
 # this nightly); ordinary name references are order-independent.
-id : Projection(Invoices, I64, _)
-id = Projection.i64("id")
+id : Projection(Invoices, IsFilterable, I64, _)
+id = Projection.filterable(Projection.i64("id"))
 
-number : Projection(Invoices, Str, _)
+number : Projection(Invoices, NotFilterable, Str, _)
 number = Projection.str("number")
 
-customer : Projection(Invoices, Str, _)
-customer = Projection.str("customer")
+customer : Projection(Invoices, IsFilterable, Str, _)
+customer = Projection.filterable(Projection.str("customer"))
 
-status : Projection(Invoices, Status, _)
+status : Projection(Invoices, NotFilterable, Status, _)
 status = Projection.str("status").map_try(status_from_str)
 
-paid_on : Projection(Invoices, Try(Str, [Null]), _)
+paid_on : Projection(Invoices, NotFilterable, Try(Str, [Null]), _)
 paid_on = Projection.nullable(Projection.str("paid_on"))
 
-row_id : Projection(InvoiceRows, I64, _)
-row_id = Projection.i64("id")
+row_id : Projection(InvoiceRows, IsFilterable, I64, _)
+row_id = Projection.filterable(Projection.i64("id"))
 
-invoice_id : Projection(InvoiceRows, I64, _)
-invoice_id = Projection.i64("invoice_id")
+invoice_id : Projection(InvoiceRows, IsFilterable, I64, _)
+invoice_id = Projection.filterable(Projection.i64("invoice_id"))
 
-description : Projection(InvoiceRows, Str, _)
+description : Projection(InvoiceRows, NotFilterable, Str, _)
 description = Projection.str("description")
 
-quantity : Projection(InvoiceRows, I64, _)
+quantity : Projection(InvoiceRows, NotFilterable, I64, _)
 quantity = Projection.i64("quantity")
 
-unit_cents : Projection(InvoiceRows, I64, _)
+unit_cents : Projection(InvoiceRows, NotFilterable, I64, _)
 unit_cents = Projection.i64("unit_cents")
 
 # Every column of each table, in field order.
@@ -371,6 +429,15 @@ main! = |_| {
 		Stdout.line!("  ${invoice.number}")?
 	}
 	Stdout.line!("  (no rows)")?
+
+	Stdout.line!("")?
+	Stdout.line!("Invoice rows of invoice 1, filtered on a filterable column:")?
+	for row in invoice_row_table
+		.filter_in(invoice_id, [1])
+		.select({ description, quantity }.Projection)
+		.query!(db)? {
+		Stdout.line!("  ${row.description}  ${row.quantity.to_str()}")?
+	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, every column:")?
