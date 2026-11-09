@@ -1,7 +1,8 @@
 ## An in-memory SQLite database with two related tables, `invoices` and
 ## `invoice_rows`. `query_invoice!` and `query_invoice_row!` take a Projection —
 ## a record of typed columns — and select exactly those columns, so each query
-## is a record shape and nothing else.
+## is a record shape and nothing else. `Projection.subset` narrows a whole-table
+## projection, so a subset cannot name a column its table does not have.
 app [main!] {
 	cli: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
 	roc: "nightly-2026-10-29-a0a9fc2",
@@ -76,6 +77,32 @@ Projection(a, err) := { columns : List(Str), decoder : Decoder(a, err) }.{
 			columns: projection.columns,
 			decoder: projection.decoder.map_try(transform),
 		}
+
+	# Narrow a whole-table projection to the columns picked from it.
+	#
+	# Every picked column must already be a column of `parent`; one that is not
+	# crashes here instead of producing SQL that reads a different table's
+	# column (or, with double-quoted names, a string literal). This is what
+	# `{ id, number }.Projection` on its own cannot promise.
+	#
+	# `subset` is pure, so where it is used decides when the check runs: a
+	# top-level constant is evaluated during compilation, and a bad column is a
+	# compile error; called from inside an effectful function, as the examples
+	# below do, it runs at run time and the crash is a runtime one. Hoist the
+	# call into a top-level constant to move that check back into the build.
+	subset : Projection(a, err), Projection(b, err) -> Projection(b, err)
+	subset = |parent, picked| {
+		for name in picked.columns {
+			if !List.contains(parent.columns, name) {
+				crash "not a column of this table: ${Str.inspect(name)}"
+			}
+		}
+		picked
+	}
+
+	# The columns this projection reads, for building SQL or for tests.
+	to_columns : Projection(a, err) -> List(Str)
+	to_columns = |projection| projection.columns
 }
 
 # Each column is typed once, here, and named after its field, so a projection
@@ -115,6 +142,17 @@ unit_cents : Projection(I64, _)
 unit_cents = Projection.i64("unit_cents")
 
 # Every column of each table, in field order.
+#
+# The record literal is the single source of truth: its fields supply the field
+# names as puns, and the builder turns them into the SQL column list and the
+# decoders into a record decoder. The type is then inferred from the literal and
+# is exactly `Invoice`, which is why the annotations here only document it —
+# deleting them still compiles. The derivation runs literal -> columns + decoder
+# -> type, never type -> columns: Roc has no type reflection, and compile-time
+# evaluation folds pure expressions rather than inspecting types, so nothing in
+# the language turns `Invoice` into `["id", "number", …]`. Each column constant
+# above exists because a field's type has to be stated once (`str` vs `i64`), and
+# that cannot be read back off the record type.
 invoice_projection : Projection(Invoice, _)
 invoice_projection = { id, number, customer, status, paid_on }.Projection
 
@@ -144,14 +182,14 @@ main! = |_| {
 	db = Sqlite.open_in_memory!()?
 	setup!(db)?
 
-	Stdout.line!("Invoices, id and number:")?
-	for invoice in query_invoice!(db, { id, number }.Projection)? {
+	Stdout.line!("Invoices, id and number (subset of the table projection):")?
+	for invoice in query_invoice!(db, invoice_projection.subset({ id, number }.Projection))? {
 		Stdout.line!("  #${invoice.id.to_str()}  ${invoice.number}")?
 	}
 
 	Stdout.line!("")?
 	Stdout.line!("Invoices, number and status:")?
-	for invoice in query_invoice!(db, { number, status }.Projection)? {
+	for invoice in query_invoice!(db, invoice_projection.subset({ number, status }.Projection))? {
 		Stdout.line!("  ${invoice.number}  ${status_to_str(invoice.status)}")?
 	}
 
@@ -166,8 +204,11 @@ main! = |_| {
 	}
 
 	Stdout.line!("")?
-	Stdout.line!("Invoice rows, description and quantity:")?
-	for row in query_invoice_row!(db, { description, quantity }.Projection)? {
+	Stdout.line!("Invoice rows, description and quantity (subset of the row table):")?
+	for row in query_invoice_row!(
+		db,
+		invoice_row_projection.subset({ description, quantity }.Projection),
+	)? {
 		Stdout.line!("  ${row.description}  ${row.quantity.to_str()}")?
 	}
 
